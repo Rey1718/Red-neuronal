@@ -40,7 +40,10 @@ for epoch in range(100000):
     optimizer.zero_grad()
     loss.backward()
     optimizer.step()
-
+     
+    if epoch % 1000 == 0:
+      print(f"Epoch {epoch}, Loss: {loss.item()}")
 # prueba
 with torch.no_grad():
     print(model(X))
+   
