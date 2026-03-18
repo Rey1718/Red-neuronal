@@ -19,20 +19,20 @@ y = torch.tensor([
 
 # modelo
 model = nn.Sequential(
-    nn.Linear(2, 2),  # capa oculta
+    nn.Linear(2, 4),  # capa oculta
     nn.Sigmoid(),
-    nn.Linear(2, 1),  # salida
+    nn.Linear(4, 1),  # salida
     nn.Sigmoid()
 )
 
 # función de pérdida
-loss_fn = nn.MSELoss()
+loss_fn = nn.BCELoss()
 
 # optimizador
-optimizer = optim.SGD(model.parameters(), lr=0.1)
+optimizer = optim.SGD(model.parameters(), lr=0.01)
 
 # entrenamiento
-for epoch in range(10000):
+for epoch in range(100000):
     y_pred = model(X)
     
     loss = loss_fn(y_pred, y)
