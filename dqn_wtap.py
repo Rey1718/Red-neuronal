@@ -1,120 +1,232 @@
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import torch.optim as optim
 import numpy as np
 import random
-import socket
+import torch
+import torch.nn as nn
+import torch.optim as optim
 from collections import deque
 
-# ===== Red neuronal DQN =====
+# ========================
+# CONFIG
+# ========================
+STATE_SIZE = 3
+ACTION_SIZE = 5
+
+GAMMA = 0.99
+LR = 0.001
+BATCH_SIZE = 256
+MEMORY_SIZE = 50000
+
+EPSILON = 1.0
+EPSILON_MIN = 0.02
+EPSILON_DECAY = 0.995
+
+EPISODES = 2000
+MAX_STEPS = 200
+
+# ========================
+# ENTORNO (SIN UNITY)
+# ========================
+class ChaseEnv:
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.agent = np.array([0.0, 0.0])
+        self.target = np.array([
+            random.uniform(-10, 10),
+            random.uniform(-10, 10)
+        ])
+        self.prev_distance = self.get_distance()
+        return self.get_state()
+
+    def get_distance(self):
+        return np.linalg.norm(self.agent - self.target)
+
+    def get_state(self):
+        dx = self.target[0] - self.agent[0]
+        dz = self.target[1] - self.agent[1]
+        dist = self.get_distance()
+        return np.array([dx/10, dz/10, dist/20], dtype=np.float32)
+
+    def step(self, action):
+        speed = 0.5
+
+        # acciones
+        if action == 0: self.agent[0] += speed
+        elif action == 1: self.agent[0] -= speed
+        elif action == 2: self.agent[1] += speed
+        elif action == 3: self.agent[1] -= speed
+        elif action == 4: pass  # idle
+
+        distance = self.get_distance()
+        reward = -0.01
+
+        delta = self.prev_distance - distance
+
+        # acercarse
+        reward += delta * 2
+
+        # alejarse castigo
+        if delta < 0:
+            reward += delta * 2
+
+        # quedarse quieto castigo
+        if abs(delta) < 0.001:
+            reward -= 0.05
+
+        # bonus cercanía
+        if distance < 2:
+            reward += 1
+
+        done = False
+
+        # alcanzó objetivo
+        if distance < 0.5:
+            reward += 10
+            done = True
+
+        self.prev_distance = distance
+
+        return self.get_state(), reward, done, {}
+
+# ========================
+# RED NEURONAL (MEJORADA)
+# ========================
 class DQN(nn.Module):
-    def __init__(self, input_size, num_actions=3):
-        super().__init__()
-        self.fc1 = nn.Linear(input_size, 128)
-        self.fc2 = nn.Linear(128, 128)
-        self.fc3 = nn.Linear(128, num_actions)
+    def __init__(self):
+        super(DQN, self).__init__()
+
+        self.net = nn.Sequential(
+            nn.Linear(STATE_SIZE, 256),
+            nn.ReLU(),
+            nn.Linear(256, 256),
+            nn.ReLU(),
+            nn.Linear(256, 128),
+            nn.ReLU(),
+            nn.Linear(128, ACTION_SIZE)
+        )
+
     def forward(self, x):
-        x = F.relu(self.fc1(x))
-        x = F.relu(self.fc2(x))
-        return self.fc3(x)
+        return self.net(x)
 
-# ===== Replay Buffer =====
-class ReplayBuffer:
-    def __init__(self, capacity=10000):
-        self.buffer = deque(maxlen=capacity)
-    def push(self, state, action, reward, next_state):
-        self.buffer.append((state, action, reward, next_state))
-    def sample(self, batch_size):
-        batch = random.sample(self.buffer, batch_size)
-        states, actions, rewards, next_states = zip(*batch)
-        return (np.array(states), np.array(actions), np.array(rewards), np.array(next_states))
-    def __len__(self):
-        return len(self.buffer)
-
-# ===== Configuración =====
-input_size = 6  # distance, dir.x, dir.z, cooldown, hit, out_of_bounds
-num_actions = 3
-gamma = 0.99
-epsilon = 0.2
-batch_size = 32
-lr = 1e-3
+# ========================
+# SETUP
+# ========================
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Usando:", device)
 
-model = DQN(input_size, num_actions).to(device)
-optimizer = optim.Adam(model.parameters(), lr=lr)
-criterion = nn.MSELoss()
-memory = ReplayBuffer()
+model = DQN().to(device)
+target_model = DQN().to(device)
+target_model.load_state_dict(model.state_dict())
 
-# ===== Socket server =====
-HOST = '127.0.0.1'
-PORT = 5005
-server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-server.bind((HOST, PORT))
-server.listen(1)
-print("Esperando conexión Unity...")
-conn, addr = server.accept()
-print("Conectado a Unity:", addr)
+optimizer = optim.Adam(model.parameters(), lr=LR)
+loss_fn = nn.MSELoss()
 
-# ===== Función para elegir acción =====
-def select_action(state):
+memory = deque(maxlen=MEMORY_SIZE)
+epsilon = EPSILON
+
+# ========================
+# FUNCIONES
+# ========================
+def choose_action(state):
     global epsilon
+
     if random.random() < epsilon:
-        return random.randint(0, num_actions-1)
-    state_tensor = torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(device)
-    with torch.no_grad():
-        q_values = model(state_tensor)
-    return torch.argmax(q_values).item()
+        return random.randint(0, ACTION_SIZE - 1)
 
-# ===== Entrenamiento DQN =====
+    state_t = torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(device)
+
+    with torch.no_grad():
+        q_values = model(state_t)
+
+    return torch.argmax(q_values[0]).item()
+
+def store_experience(s, a, r, s_next, done):
+    memory.append((s, a, r, s_next, done))
+
 def train():
-    if len(memory) < batch_size:
+    if len(memory) < BATCH_SIZE:
         return
-    states, actions, rewards, next_states = memory.sample(batch_size)
-    states = torch.tensor(states, dtype=torch.float32).to(device)
-    actions = torch.tensor(actions, dtype=torch.long).to(device)
-    rewards = torch.tensor(rewards, dtype=torch.float32).to(device)
-    next_states = torch.tensor(next_states, dtype=torch.float32).to(device)
 
-    q_values = model(states).gather(1, actions.unsqueeze(1)).squeeze(1)
-    with torch.no_grad():
-        target = rewards + gamma * model(next_states).max(1)[0]
-    loss = criterion(q_values, target)
+    batch = random.sample(memory, BATCH_SIZE)
+    states, actions, rewards, next_states, dones = zip(*batch)
+
+    states = torch.tensor(np.array(states), dtype=torch.float32).to(device)
+    next_states = torch.tensor(np.array(next_states), dtype=torch.float32).to(device)
+    actions = torch.tensor(actions).to(device)
+    rewards = torch.tensor(rewards).to(device)
+    dones = torch.tensor(dones).float().to(device)
+
+    q_values = model(states)
+    next_q_values = target_model(next_states)
+
+    target = q_values.clone()
+
+    for i in range(BATCH_SIZE):
+        target_q = rewards[i]
+        if not dones[i]:
+            target_q += GAMMA * torch.max(next_q_values[i])
+        target[i][actions[i]] = target_q
+
+    loss = loss_fn(q_values, target)
+
     optimizer.zero_grad()
     loss.backward()
     optimizer.step()
 
-# ===== Loop principal =====
-prev_action = 0
-last_state = None
+# ========================
+# ENTRENAMIENTO
+# ========================
+env = ChaseEnv()
 
-while True:
-    try:
-        data = conn.recv(1024)
-        if not data:
-            break
-        obs = np.array([float(x) for x in data.decode().split(',')], dtype=np.float32)
-        if len(obs) != input_size:
-            print(f"Error: Unity envió {len(obs)} observables, se esperan {input_size}")
-            continue
+for ep in range(EPISODES):
 
-        state = obs
-        action = 1
-        conn.send(bytes([action]))
+    state = env.reset()
 
-        # Reward
-        reward = 1.0 if state[4] == 1 else -0.1
-        if state[5] == 1:
-            reward -= 1.0
+    total_reward = 0
+    direction_changes = 0
+    idle_count = 0
+    prev_action = None
 
-        if last_state is not None:
-            memory.push(last_state, prev_action, reward, state)
-            train()
-            print(f"Reward: {reward:.2f} | Acción anterior: {prev_action} | Buffer: {len(memory)}")
+    for step in range(MAX_STEPS):
 
-        last_state = state
+        action = choose_action(state)
+
+        # métricas w-tap
+        if prev_action is not None and action != prev_action:
+            direction_changes += 1
+
+        if action == 4:
+            idle_count += 1
+
+        next_state, reward, done, _ = env.step(action)
+
+        store_experience(state, action, reward, next_state, done)
+        train()
+
+        state = next_state
         prev_action = action
+        total_reward += reward
 
-    except Exception as e:
-        print("Error loop principal:", e)
-        break
+        if done:
+            break
+
+    # epsilon decay
+    if epsilon > EPSILON_MIN:
+        epsilon *= EPSILON_DECAY
+
+    # actualizar target
+    if ep % 20 == 0:
+        target_model.load_state_dict(model.state_dict())
+
+    # métricas
+    wtap_score = direction_changes / (step + 1)
+
+    print(f"Ep:{ep} | Reward:{total_reward:.2f} | Steps:{step} | Wtap:{wtap_score:.2f} | Eps:{epsilon:.3f}")
+
+# ========================
+# GUARDAR MODELO
+# ========================
+torch.save(model.state_dict(), "dqn_chase_model.pth")
+print("💾 Modelo guardado")
