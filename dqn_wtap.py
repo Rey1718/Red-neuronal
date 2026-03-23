@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from collections import deque
-
+import os
 # ========================
 # CONFIG
 # ========================
@@ -77,13 +77,13 @@ class ChaseEnv:
 
         # bonus cercanía
         if distance < 2:
-            reward += 1
+            reward += 0.2
 
         done = False
 
         # alcanzó objetivo
         if distance < 0.5:
-            reward += 10
+            reward += 0.9
             done = True
 
         self.prev_distance = distance
@@ -175,58 +175,99 @@ def train():
     loss.backward()
     optimizer.step()
 
+
+if os.path.exists("checkpoint.pth"):
+    checkpoint = torch.load("checkpoint.pth")
+
+    model.load_state_dict(checkpoint["model"])
+    target_model.load_state_dict(checkpoint["model"])
+    epsilon = checkpoint["epsilon"]
+
+    print("✅ Checkpoint cargado")
+else:
+    print("⚠️ Entrenamiento desde cero")
 # ========================
 # ENTRENAMIENTO
 # ========================
 env = ChaseEnv()
 
-for ep in range(EPISODES):
+try:
+    for ep in range(EPISODES):
 
-    state = env.reset()
+        state = env.reset()
 
-    total_reward = 0
-    direction_changes = 0
-    idle_count = 0
-    prev_action = None
+        total_reward = 0
+        direction_changes = 0
+        idle_count = 0
+        prev_action = None
 
-    for step in range(MAX_STEPS):
+        for step in range(MAX_STEPS):
 
-        action = choose_action(state)
+            action = choose_action(state)
 
-        # métricas w-tap
-        if prev_action is not None and action != prev_action:
-            direction_changes += 1
+            # métricas w-tap
+            if prev_action is not None and action != prev_action:
+                direction_changes += 1
 
-        if action == 4:
-            idle_count += 1
+            if action == 4:  # idle
+                idle_count += 1
 
-        next_state, reward, done, _ = env.step(action)
+            next_state, reward, done, _ = env.step(action)
 
-        store_experience(state, action, reward, next_state, done)
-        train()
+            # BONUS por W-tap correcto
+            if prev_action is not None:
+                if prev_action == 0 and action == 1:
+                    reward += 1
+                if prev_action == 1 and action == 0:
+                    reward += 1
 
-        state = next_state
-        prev_action = action
-        total_reward += reward
+            # CASTIGO por W-tap deficiente
+            if prev_action is not None:
+                # castigo si no cambia de dirección y no está idle
+                if action != 4 and action == prev_action:
+                    reward -= 0.5  # penaliza correr en la misma dirección
+                # castigo extra si idle demasiado
+                if idle_count > 3:
+                    reward -= 0.5
 
-        if done:
-            break
+            store_experience(state, action, reward, next_state, done)
+            train()
 
-    # epsilon decay
-    if epsilon > EPSILON_MIN:
-        epsilon *= EPSILON_DECAY
+            state = next_state
+            prev_action = action
+            total_reward += reward
 
-    # actualizar target
-    if ep % 20 == 0:
-        target_model.load_state_dict(model.state_dict())
+            if done:
+                break
 
-    # métricas
-    wtap_score = direction_changes / (step + 1)
+        # epsilon decay
+        if epsilon > EPSILON_MIN:
+            epsilon *= EPSILON_DECAY
 
-    print(f"Ep:{ep} | Reward:{total_reward:.2f} | Steps:{step} | Wtap:{wtap_score:.2f} | Eps:{epsilon:.3f}")
+        # actualizar target
+        if ep % 20 == 0:
+            target_model.load_state_dict(model.state_dict())
 
-# ========================
-# GUARDAR MODELO
-# ========================
-torch.save(model.state_dict(), "dqn_chase_model.pth")
-print("💾 Modelo guardado")
+        # métricas
+        wtap_score = direction_changes / (step + 1)
+
+        print(f"Ep:{ep} | Reward:{total_reward:.2f} | Steps:{step} | Wtap:{wtap_score:.2f} | Eps:{epsilon:.3f}")
+
+        # ========================
+        # GUARDAR MODELO CADA 20 EPISODIOS
+        # ========================
+        if ep % 20 == 0:
+            torch.save({
+                "model": model.state_dict(),
+                "epsilon": epsilon
+            }, "checkpoint.pth")
+
+except KeyboardInterrupt:
+    print("🛑 Detenido")
+
+    torch.save({
+        "model": model.state_dict(),
+        "epsilon": epsilon
+    }, "checkpoint.pth")
+
+    print("💾 Guardado de emergencia")
